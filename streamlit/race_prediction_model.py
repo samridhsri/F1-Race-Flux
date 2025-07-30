@@ -18,12 +18,25 @@ import logging
 import time
 import json
 from datetime import datetime
+import mlflow
+import mlflow.spark
+import mlflow.sklearn
+from mlflow.tracking import MlflowClient
+from sklearn.metrics import mean_absolute_error, r2_score
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("RacePredictionModel")
+
+# Configure MLflow
+MLFLOW_TRACKING_URI = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5001")
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+logger.info(f"MLflow tracking URI set to: {MLFLOW_TRACKING_URI}")
+
+# Initialize MLflow client
+mlflow_client = MlflowClient()
 
 # Create cache directory if it doesn't exist
 CACHE_DIR = "/app/predictions/cache"
@@ -454,246 +467,355 @@ def preprocess_data(data):
     return model_df
 
 
-def build_model(training_data):
+def build_model(training_data, experiment_name="F1 Race Prediction", race_name="Unknown"):
     """
-    Build and train a Gradient Boosting model using PySpark MLlib
+    Build and train a Gradient Boosting model using PySpark MLlib with MLflow tracking
 
     Parameters:
     - training_data: Preprocessed DataFrame for training
+    - experiment_name: Name of the MLflow experiment
+    - race_name: Name of the race being predicted
 
     Returns:
     - Trained model and preprocessing pipeline
     """
-    logger.info("Building and training prediction model with PySpark MLlib")
+    logger.info("Building and training prediction model with PySpark MLlib and MLflow tracking")
 
     if training_data is None or training_data.empty:
         logger.error("No training data available")
         return None, None
 
-    # Initialize Spark session with simplified configuration for container environment
+    # Set or create MLflow experiment
     try:
-        spark = (
-            SparkSession.builder.appName("F1RacePrediction")
-            .master("local[*]")
-            .config("spark.driver.memory", "1g")
-            .config("spark.executor.memory", "1g")
-            .config("spark.ui.enabled", "false")
-            .config("spark.sql.execution.arrow.pyspark.enabled", "false")
-            .config("spark.driver.bindAddress", "127.0.0.1")
-            .getOrCreate()
-        )
-
-        logger.info("Successfully created Spark session")
-
-        # Preprocess data to ensure consistent types for Spark
-        preprocessed_data = training_data.copy()
-
-        # Special handling for HadRainfall column which has caused issues
-        if "HadRainfall" in preprocessed_data.columns:
-            logger.info("Converting HadRainfall to integer type")
-            if pd.api.types.is_bool_dtype(preprocessed_data["HadRainfall"]):
-                preprocessed_data["HadRainfall"] = preprocessed_data[
-                    "HadRainfall"
-                ].astype(int)
-            else:
-                # If it's not already boolean, convert through string to int
-                preprocessed_data["HadRainfall"] = preprocessed_data[
-                    "HadRainfall"
-                ].astype(str)
-                preprocessed_data["HadRainfall"] = preprocessed_data["HadRainfall"].map(
-                    {"True": 1, "False": 0, "true": 1, "false": 0, "1": 1, "0": 0}
-                )
-                preprocessed_data["HadRainfall"] = (
-                    preprocessed_data["HadRainfall"].fillna(0).astype(int)
-                )
-
-            # Double check the conversion
-            logger.info(
-                f"HadRainfall column type is now: {preprocessed_data['HadRainfall'].dtype}"
+        experiment = mlflow.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            experiment_id = mlflow.create_experiment(
+                experiment_name,
+                tags={
+                    "project": "f1-data-pipeline",
+                    "model_type": "gradient_boosting_regressor",
+                    "domain": "motorsports"
+                }
             )
+        else:
+            experiment_id = experiment.experiment_id
+        mlflow.set_experiment(experiment_name)
+        logger.info(f"Using MLflow experiment: {experiment_name} (ID: {experiment_id})")
+    except Exception as e:
+        logger.warning(f"Failed to set MLflow experiment: {e}")
+        return None, None
 
-        # Convert boolean columns to integer (0/1) to avoid type conflicts
-        for col in preprocessed_data.columns:
-            if pd.api.types.is_bool_dtype(preprocessed_data[col]):
-                logger.info(f"Converting boolean column {col} to integer")
-                preprocessed_data[col] = preprocessed_data[col].astype(int)
-            elif preprocessed_data[col].dtype == "object":
-                # Ensure all string columns are properly formatted
-                preprocessed_data[col] = preprocessed_data[col].astype(str)
-            elif pd.api.types.is_float_dtype(preprocessed_data[col]):
-                # Handle NaNs in float columns
-                preprocessed_data[col] = preprocessed_data[col].fillna(0.0)
-            elif pd.api.types.is_integer_dtype(preprocessed_data[col]):
-                # Handle NaNs in integer columns
-                preprocessed_data[col] = preprocessed_data[col].fillna(0)
-
-        # Log the data types of all columns for debugging
-        logger.info("Data types after preprocessing:")
-        for col, dtype in preprocessed_data.dtypes.items():
-            logger.info(f"Column: {col}, Type: {dtype}")
-
-        # Convert pandas DataFrame to Spark DataFrame
+    # Start MLflow run
+    with mlflow.start_run(run_name=f"F1_Race_Prediction_{race_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}") as run:
+        
+        # Log run metadata
+        mlflow.set_tags({
+            "race_name": race_name,
+            "model_framework": "pyspark_mllib",
+            "data_years": str(training_data["Year"].unique().tolist()),
+            "training_samples": len(training_data)
+        })
+        
+        # Initialize Spark session with simplified configuration for container environment
         try:
-            logger.info("Converting pandas DataFrame to Spark DataFrame")
-            spark_df = spark.createDataFrame(preprocessed_data)
-            logger.info(
-                f"Successfully created Spark DataFrame with {spark_df.count()} rows"
+            spark = (
+                SparkSession.builder.appName("F1RacePrediction")
+                .master("local[*]")
+                .config("spark.driver.memory", "1g")
+                .config("spark.executor.memory", "1g")
+                .config("spark.ui.enabled", "false")
+                .config("spark.sql.execution.arrow.pyspark.enabled", "false")
+                .config("spark.driver.bindAddress", "127.0.0.1")
+                .getOrCreate()
             )
 
-            # Log Spark DataFrame schema for debugging
-            logger.info("Spark DataFrame schema:")
-            for field in spark_df.schema.fields:
-                logger.info(f"Column: {field.name}, Type: {field.dataType}")
+            logger.info("Successfully created Spark session")
 
-        except Exception as e:
-            logger.error(f"Error converting DataFrame: {e}")
-            # Fallback: try schema-based conversion
-            try:
-                from pyspark.sql.types import (
-                    StructType,
-                    StructField,
-                    StringType,
-                    DoubleType,
-                    IntegerType,
-                )
+            # Preprocess data to ensure consistent types for Spark
+            preprocessed_data = training_data.copy()
 
-                # Create schema manually
-                logger.info("Attempting schema-based conversion")
-                fields = []
-                for col_name, dtype in preprocessed_data.dtypes.items():
-                    if col_name == "HadRainfall":
-                        # Ensure HadRainfall is always IntegerType
-                        fields.append(StructField(col_name, IntegerType(), True))
-                    elif pd.api.types.is_float_dtype(dtype):
-                        fields.append(StructField(col_name, DoubleType(), True))
-                    elif pd.api.types.is_integer_dtype(dtype):
-                        fields.append(StructField(col_name, IntegerType(), True))
-                    else:
-                        fields.append(StructField(col_name, StringType(), True))
+            # Special handling for HadRainfall column which has caused issues
+            if "HadRainfall" in preprocessed_data.columns:
+                logger.info("Converting HadRainfall to integer type")
+                if pd.api.types.is_bool_dtype(preprocessed_data["HadRainfall"]):
+                    preprocessed_data["HadRainfall"] = preprocessed_data[
+                        "HadRainfall"
+                    ].astype(int)
+                else:
+                    # If it's not already boolean, convert through string to int
+                    preprocessed_data["HadRainfall"] = preprocessed_data[
+                        "HadRainfall"
+                    ].astype(str)
+                    preprocessed_data["HadRainfall"] = preprocessed_data["HadRainfall"].map(
+                        {"True": 1, "False": 0, "true": 1, "false": 0, "1": 1, "0": 0}
+                    )
+                    preprocessed_data["HadRainfall"] = (
+                        preprocessed_data["HadRainfall"].fillna(0).astype(int)
+                    )
 
-                schema = StructType(fields)
-                spark_df = spark.createDataFrame(
-                    preprocessed_data.values.tolist(), schema=schema
-                )
-                spark_df = spark_df.toDF(*preprocessed_data.columns)
+                # Double check the conversion
                 logger.info(
-                    f"Successfully created Spark DataFrame with schema, {spark_df.count()} rows"
+                    f"HadRainfall column type is now: {preprocessed_data['HadRainfall'].dtype}"
+                )
+
+            # Convert boolean columns to integer (0/1) to avoid type conflicts
+            for col in preprocessed_data.columns:
+                if pd.api.types.is_bool_dtype(preprocessed_data[col]):
+                    logger.info(f"Converting boolean column {col} to integer")
+                    preprocessed_data[col] = preprocessed_data[col].astype(int)
+                elif preprocessed_data[col].dtype == "object":
+                    # Ensure all string columns are properly formatted
+                    preprocessed_data[col] = preprocessed_data[col].astype(str)
+                elif pd.api.types.is_float_dtype(preprocessed_data[col]):
+                    # Handle NaNs in float columns
+                    preprocessed_data[col] = preprocessed_data[col].fillna(0.0)
+                elif pd.api.types.is_integer_dtype(preprocessed_data[col]):
+                    # Handle NaNs in integer columns
+                    preprocessed_data[col] = preprocessed_data[col].fillna(0)
+
+            # Log the data types of all columns for debugging
+            logger.info("Data types after preprocessing:")
+            for col, dtype in preprocessed_data.dtypes.items():
+                logger.info(f"Column: {col}, Type: {dtype}")
+
+            # Convert pandas DataFrame to Spark DataFrame
+            try:
+                logger.info("Converting pandas DataFrame to Spark DataFrame")
+                spark_df = spark.createDataFrame(preprocessed_data)
+                logger.info(
+                    f"Successfully created Spark DataFrame with {spark_df.count()} rows"
                 )
 
                 # Log Spark DataFrame schema for debugging
-                logger.info("Spark DataFrame schema (manual):")
+                logger.info("Spark DataFrame schema:")
                 for field in spark_df.schema.fields:
                     logger.info(f"Column: {field.name}, Type: {field.dataType}")
 
-            except Exception as e2:
-                logger.error(f"Schema-based conversion also failed: {e2}")
-                raise RuntimeError(
-                    "Could not convert pandas DataFrame to Spark DataFrame"
-                ) from e
+            except Exception as e:
+                logger.error(f"Error converting DataFrame: {e}")
+                # Fallback: try schema-based conversion
+                try:
+                    from pyspark.sql.types import (
+                        StructType,
+                        StructField,
+                        StringType,
+                        DoubleType,
+                        IntegerType,
+                    )
 
-        # Define features and target
-        target_col = "Position"
+                    # Create schema manually
+                    logger.info("Attempting schema-based conversion")
+                    fields = []
+                    for col_name, dtype in preprocessed_data.dtypes.items():
+                        if col_name == "HadRainfall":
+                            # Ensure HadRainfall is always IntegerType
+                            fields.append(StructField(col_name, IntegerType(), True))
+                        elif pd.api.types.is_float_dtype(dtype):
+                            fields.append(StructField(col_name, DoubleType(), True))
+                        elif pd.api.types.is_integer_dtype(dtype):
+                            fields.append(StructField(col_name, IntegerType(), True))
+                        else:
+                            fields.append(StructField(col_name, StringType(), True))
 
-        # Identify categorical and numerical columns
-        categorical_features = ["FullName", "TeamName", "GrandPrix"]
-        categorical_features = [
-            f for f in categorical_features if f in preprocessed_data.columns
-        ]
+                    schema = StructType(fields)
+                    spark_df = spark.createDataFrame(
+                        preprocessed_data.values.tolist(), schema=schema
+                    )
+                    spark_df = spark_df.toDF(*preprocessed_data.columns)
+                    logger.info(
+                        f"Successfully created Spark DataFrame with schema, {spark_df.count()} rows"
+                    )
 
-        numeric_features = preprocessed_data.select_dtypes(
-            include=["number"]
-        ).columns.tolist()
-        numeric_features = [f for f in numeric_features if f != target_col]
+                    # Log Spark DataFrame schema for debugging
+                    logger.info("Spark DataFrame schema (manual):")
+                    for field in spark_df.schema.fields:
+                        logger.info(f"Column: {field.name}, Type: {field.dataType}")
 
-        logger.info(f"Using categorical features: {categorical_features}")
-        logger.info(f"Using numeric features: {numeric_features}")
+                except Exception as e2:
+                    logger.error(f"Schema-based conversion also failed: {e2}")
+                    raise RuntimeError(
+                        "Could not convert pandas DataFrame to Spark DataFrame"
+                    ) from e
 
-        # Create preprocessing stages
-        # 1. String indexers for categorical features
-        indexers = [
-            StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid="keep")
-            for col in categorical_features
-        ]
+            # Define features and target
+            target_col = "Position"
 
-        # 2. One-hot encoding for indexed categorical features
-        encoders = [
-            OneHotEncoder(inputCol=f"{col}_idx", outputCol=f"{col}_vec")
-            for col in categorical_features
-        ]
+            # Identify categorical and numerical columns
+            categorical_features = ["FullName", "TeamName", "GrandPrix"]
+            categorical_features = [
+                f for f in categorical_features if f in preprocessed_data.columns
+            ]
 
-        # 3. Vector assembler for numerical features
-        numeric_assembler = VectorAssembler(
-            inputCols=numeric_features,
-            outputCol="numeric_features",
-            handleInvalid="keep",
-        )
+            numeric_features = preprocessed_data.select_dtypes(
+                include=["number"]
+            ).columns.tolist()
+            numeric_features = [f for f in numeric_features if f != target_col]
 
-        # 4. Standard scaler for numerical features
-        scaler = StandardScaler(
-            inputCol="numeric_features",
-            outputCol="scaled_numeric_features",
-            withStd=True,
-            withMean=True,
-        )
+            logger.info(f"Using categorical features: {categorical_features}")
+            logger.info(f"Using numeric features: {numeric_features}")
 
-        # 5. Assemble all features together
-        categorical_vec_cols = [f"{col}_vec" for col in categorical_features]
-        assembler = VectorAssembler(
-            inputCols=categorical_vec_cols + ["scaled_numeric_features"],
-            outputCol="features",
-            handleInvalid="keep",
-        )
+            # Create preprocessing stages
+            # 1. String indexers for categorical features
+            indexers = [
+                StringIndexer(inputCol=col, outputCol=f"{col}_idx", handleInvalid="keep")
+                for col in categorical_features
+            ]
 
-        # 6. Create the gradient boosting regressor with reduced complexity for container
-        gbt = GBTRegressor(
-            featuresCol="features",
-            labelCol=target_col,
-            maxIter=50,
-            maxDepth=3,
-            stepSize=0.1,
-        )
+            # 2. One-hot encoding for indexed categorical features
+            encoders = [
+                OneHotEncoder(inputCol=f"{col}_idx", outputCol=f"{col}_vec")
+                for col in categorical_features
+            ]
 
-        # Create the pipeline
-        pipeline = Pipeline(
-            stages=indexers + encoders + [numeric_assembler, scaler, assembler, gbt]
-        )
+            # 3. Vector assembler for numerical features
+            numeric_assembler = VectorAssembler(
+                inputCols=numeric_features,
+                outputCol="numeric_features",
+                handleInvalid="keep",
+            )
 
-        # Split data into training and test sets
-        train_df, test_df = spark_df.randomSplit([0.8, 0.2], seed=42)
+            # 4. Standard scaler for numerical features
+            scaler = StandardScaler(
+                inputCol="numeric_features",
+                outputCol="scaled_numeric_features",
+                withStd=True,
+                withMean=True,
+            )
 
-        # Train the model
-        logger.info("Training the PySpark GBT model...")
-        model = pipeline.fit(train_df)
+            # 5. Assemble all features together
+            categorical_vec_cols = [f"{col}_vec" for col in categorical_features]
+            assembler = VectorAssembler(
+                inputCols=categorical_vec_cols + ["scaled_numeric_features"],
+                outputCol="features",
+                handleInvalid="keep",
+            )
 
-        # Evaluate model
-        logger.info("Evaluating the model...")
-        predictions = model.transform(test_df)
+            # 6. Create the gradient boosting regressor with reduced complexity for container
+            # Log hyperparameters
+            max_iter = 50
+            max_depth = 3
+            step_size = 0.1
+            
+            mlflow.log_params({
+                "max_iter": max_iter,
+                "max_depth": max_depth,
+                "step_size": step_size,
+                "algorithm": "Gradient Boosting Trees",
+                "categorical_features": len(categorical_features),
+                "numeric_features": len(numeric_features)
+            })
+            
+            gbt = GBTRegressor(
+                featuresCol="features",
+                labelCol=target_col,
+                maxIter=max_iter,
+                maxDepth=max_depth,
+                stepSize=step_size,
+            )
 
-        evaluator = RegressionEvaluator(
-            labelCol=target_col, predictionCol="prediction", metricName="r2"
-        )
+            # Create the pipeline
+            pipeline = Pipeline(
+                stages=indexers + encoders + [numeric_assembler, scaler, assembler, gbt]
+            )
 
-        r2 = evaluator.evaluate(predictions)
-        rmse = evaluator.setMetricName("rmse").evaluate(predictions)
+            # Split data into training and test sets
+            train_df, test_df = spark_df.randomSplit([0.8, 0.2], seed=42)
 
-        logger.info(f"Model training completed with R² score: {r2:.3f}")
-        logger.info(f"RMSE: {rmse:.3f}")
+            # Train the model
+            logger.info("Training the PySpark GBT model...")
+            model = pipeline.fit(train_df)
 
-        # Store the Spark session with the model for predictions
-        # We return the full pipeline and the Spark session
-        return model, spark
+            # Evaluate model
+            logger.info("Evaluating the model...")
+            predictions = model.transform(test_df)
 
-    except Exception as e:
-        logger.error(f"Error in PySpark model building: {e}")
-        import traceback
+            evaluator = RegressionEvaluator(
+                labelCol=target_col, predictionCol="prediction", metricName="r2"
+            )
 
-        logger.error(traceback.format_exc())
-        try:
-            if "spark" in locals() and spark is not None:
-                spark.stop()
-        except:
-            pass
-        return None, None
+            r2 = evaluator.evaluate(predictions)
+            rmse = evaluator.setMetricName("rmse").evaluate(predictions)
+            mae = evaluator.setMetricName("mae").evaluate(predictions)
+
+            logger.info(f"Model training completed with R² score: {r2:.3f}")
+            logger.info(f"RMSE: {rmse:.3f}")
+            logger.info(f"MAE: {mae:.3f}")
+
+            # Log metrics to MLflow
+            mlflow.log_metrics({
+                "r2_score": r2,
+                "rmse": rmse,
+                "mae": mae,
+                "training_samples": train_df.count(),
+                "test_samples": test_df.count()
+            })
+            
+            # Calculate custom F1-specific metrics
+            predictions_pd = predictions.select("prediction", target_col).toPandas()
+            
+            # Position accuracy (within 2 positions)
+            position_accuracy = (abs(predictions_pd["prediction"] - predictions_pd[target_col]) <= 2).mean()
+            
+            # Podium prediction rate (top 3 positions)
+            actual_podium = predictions_pd[target_col] <= 3
+            predicted_podium = predictions_pd["prediction"] <= 3
+            podium_accuracy = (actual_podium == predicted_podium).mean()
+            
+            mlflow.log_metrics({
+                "position_accuracy_within_2": position_accuracy,
+                "podium_prediction_accuracy": podium_accuracy
+            })
+            
+            # Log model artifacts
+            try:
+                # Save model to MLflow and register it
+                model_name = f"F1RacePredictor_{race_name.replace(' ', '_').replace('-', '_')}"
+                
+                # Log the model first
+                mlflow.spark.log_model(
+                    model, 
+                    "f1_race_predictor",
+                    input_example=train_df.limit(1).toPandas(),
+                    signature=mlflow.models.infer_signature(
+                        train_df.select([col for col in train_df.columns if col != target_col]).limit(1).toPandas(),
+                        predictions.select("prediction").limit(1).toPandas()
+                    )
+                )
+                
+                # Register the model explicitly
+                try:
+                    model_uri = f"runs:/{mlflow.active_run().info.run_id}/f1_race_predictor"
+                    mlflow.register_model(model_uri, model_name)
+                    logger.info(f"Model registered as {model_name}")
+                except Exception as reg_e:
+                    logger.warning(f"Failed to register model: {reg_e}")
+                
+                # Create and log visualizations
+                create_model_visualizations(predictions_pd, target_col)
+                
+                # Log additional artifacts
+                mlflow.log_text(f"Race: {race_name}\nTraining Years: {training_data['Year'].unique().tolist()}\nModel Type: Gradient Boosting Trees", "model_info.txt")
+                
+                logger.info("Model and artifacts logged to MLflow successfully")
+                
+            except Exception as e:
+                logger.warning(f"Failed to log model to MLflow: {e}")
+
+            # Store the Spark session with the model for predictions
+            # We return the full pipeline and the Spark session
+            return model, spark
+
+        except Exception as e:
+            logger.error(f"Error in PySpark model building: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            try:
+                if "spark" in locals() and spark is not None:
+                    spark.stop()
+            except:
+                pass
+            return None, None
 
 
 def create_2025_driver_dataset(training_data):
@@ -1241,6 +1363,68 @@ def predict_race_outcome(model, spark, training_data, prediction_data):
         return None
 
 
+def create_model_visualizations(predictions_pd, target_col):
+    """
+    Create and log model visualization artifacts to MLflow
+    
+    Parameters:
+    - predictions_pd: Pandas DataFrame with predictions and actual values
+    - target_col: Name of the target column
+    """
+    try:
+        # Create prediction vs actual plot
+        plt.figure(figsize=(10, 8))
+        plt.scatter(predictions_pd[target_col], predictions_pd["prediction"], alpha=0.7)
+        plt.plot([predictions_pd[target_col].min(), predictions_pd[target_col].max()], 
+                [predictions_pd[target_col].min(), predictions_pd[target_col].max()], 
+                'r--', lw=2)
+        plt.xlabel('Actual Position')
+        plt.ylabel('Predicted Position')
+        plt.title('Predicted vs Actual Race Positions')
+        plt.grid(True, alpha=0.3)
+        
+        # Add R² score to plot
+        from sklearn.metrics import r2_score
+        r2 = r2_score(predictions_pd[target_col], predictions_pd["prediction"])
+        plt.text(0.05, 0.95, f'R² = {r2:.3f}', transform=plt.gca().transAxes, 
+                bbox=dict(boxstyle="round", facecolor='wheat', alpha=0.8))
+        
+        plt.tight_layout()
+        mlflow.log_figure(plt.gcf(), "prediction_vs_actual.png")
+        plt.close()
+        
+        # Create residuals plot
+        plt.figure(figsize=(10, 6))
+        residuals = predictions_pd["prediction"] - predictions_pd[target_col]
+        plt.scatter(predictions_pd["prediction"], residuals, alpha=0.7)
+        plt.axhline(y=0, color='r', linestyle='--')
+        plt.xlabel('Predicted Position')
+        plt.ylabel('Residuals (Predicted - Actual)')
+        plt.title('Residuals Plot')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        mlflow.log_figure(plt.gcf(), "residuals_plot.png")
+        plt.close()
+        
+        # Create histogram of errors
+        plt.figure(figsize=(10, 6))
+        plt.hist(residuals, bins=20, alpha=0.7, edgecolor='black')
+        plt.xlabel('Prediction Error (positions)')
+        plt.ylabel('Frequency')
+        plt.title('Distribution of Prediction Errors')
+        plt.axvline(x=0, color='r', linestyle='--', label='Perfect Prediction')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        mlflow.log_figure(plt.gcf(), "error_distribution.png")
+        plt.close()
+        
+        logger.info("Model visualizations created and logged to MLflow")
+        
+    except Exception as e:
+        logger.warning(f"Failed to create model visualizations: {e}")
+
+
 def save_prediction_results(predictions_df, race_name):
     """
     Save prediction results to file
@@ -1331,7 +1515,7 @@ def run_prediction_model(race_name, source_years_str="2022,2023,2024"):
 
         # 3. Build and train the model
         logger.info("Step 3: Building and training the model...")
-        model, spark = build_model(processed_data)
+        model, spark = build_model(processed_data, race_name=race_name)
 
         if model is None:
             logger.error("Failed to build model")

@@ -37,11 +37,22 @@ def show_race_predictions():
     if not st.session_state.prediction_events:
         fetch_prediction_events()
 
+    # Show prediction configuration section
     show_ml_prediction_section()
 
-    # If ML model predictions exist, display them
-    if st.session_state.model_predictions is not None:
+    # If ML model predictions exist, display them (this will show the full race results)
+    if st.session_state.model_predictions is not None and not st.session_state.model_predictions.empty:
         display_ml_prediction_results(st.session_state.model_predictions)
+    elif st.session_state.model_predictions is not None:
+        st.warning("Model predictions are empty. Please try running the prediction again.")
+    else:
+        # Show info about what will be displayed
+        st.info("💡 **What you'll see after running a prediction:**")
+        st.write("- 🏆 **Race Results Table**: Predicted finishing positions with race times")
+        st.write("- 📊 **Lap-by-Lap Positions**: Interactive position changes throughout the race")
+        st.write("- 🌦️ **Weather Impact**: How weather conditions affect performance")
+        st.write("- 🏎️ **Tire Degradation**: Tire strategy and degradation analysis")
+        st.write("- 📈 **Position Charts**: Visual comparison of predicted results")
 
 
 def show_ml_prediction_section():
@@ -125,21 +136,32 @@ def show_ml_prediction_section():
                     "Loading historical data, training model, and generating predictions..."
                 ):
                     st.session_state.model_running = True
-                    # Run the ML prediction
-                    predictions = race_prediction_model.run_prediction_model(
-                        selected_ml_event, source_years_ml
-                    )
-                    st.session_state.model_running = False
+                    try:
+                        # Run the ML prediction
+                        predictions = race_prediction_model.run_prediction_model(
+                            selected_ml_event, source_years_ml
+                        )
+                        st.session_state.model_running = False
 
-                    if predictions is not None and not predictions.empty:
-                        st.session_state.model_predictions = predictions
-                        st.success(
-                            f"Successfully generated predictions for {selected_ml_event}"
-                        )
-                    else:
-                        st.error(
-                            "Failed to generate predictions. Check logs for details."
-                        )
+                        if predictions is not None and not predictions.empty:
+                            st.session_state.model_predictions = predictions
+                            st.success(
+                                f"Successfully generated predictions for {selected_ml_event}"
+                            )
+                            # Force a rerun to display the results immediately
+                            st.experimental_rerun()
+                        else:
+                            st.error(
+                                "Failed to generate predictions. Check logs for details."
+                            )
+                    except Exception as e:
+                        st.session_state.model_running = False
+                        st.error(f"Error during prediction: {str(e)}")
+                        st.write("**Debug Info:**")
+                        st.write(f"Selected event: {selected_ml_event}")
+                        st.write(f"Source years: {source_years_ml}")
+                        import traceback
+                        st.text(traceback.format_exc())
     else:
         st.warning(
             "No 2025 events available. Click the refresh button to fetch events."
@@ -191,7 +213,12 @@ def load_saved_predictions():
 def display_ml_prediction_results(predictions_df):
     """Display machine learning model prediction results"""
     st.markdown("---")
+    
+    # Add a clear header with success indicator
+    st.success(f"🏁 Race Prediction Results Generated!")
     st.subheader(f"Race Prediction: {predictions_df['GrandPrix'].iloc[0]} 2025")
+    st.write(f"**Generated:** {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.write(f"**Drivers:** {len(predictions_df)} drivers predicted")
 
     # Format the DataFrame for display
     display_df = predictions_df.copy()

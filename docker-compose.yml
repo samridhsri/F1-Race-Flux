@@ -51,6 +51,40 @@ services:
       MONGO_INITDB_DATABASE: f1db
     mem_limit: 3g
     
+  postgres:
+    image: postgres:15
+    platform: linux/arm64
+    container_name: mlflow-postgres
+    environment:
+      POSTGRES_DB: mlflowdb
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: mlflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    mem_limit: 512m
+
+  mlflow:
+    image: python:3.9-slim
+    platform: linux/arm64
+    container_name: mlflow-server
+    depends_on:
+      - postgres
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+      - ./mlflow:/app
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mlflow:mlflow@postgres:5432/mlflowdb
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+      - PYTHONUNBUFFERED=1
+    command: ["bash", "/app/start_mlflow.sh"]
+    restart: always
+    mem_limit: 1g
+    
   spark-master:
     image: bitnami/spark:3.3.2
     platform: linux/arm64
@@ -143,17 +177,6 @@ services:
     image: producer-image
     entrypoint: ["echo", "Image built: producer-image"]
     
-  analytics:
-    build:
-      context: ./analytics
-    container_name: analytics
-    ports:
-      - "8090:8090"
-    depends_on:
-      - mongodb
-    restart: always
-    mem_limit: 1g
-  
   streamlit:
     build:
       context: ./streamlit
@@ -164,15 +187,19 @@ services:
     depends_on:
       - mongodb
       - api
+      - mlflow
     volumes:
       - ./streamlit:/app
     restart: always
     environment:
       - PYTHONUNBUFFERED=1
       - API_BASE_URL=http://api:8000
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
     mem_limit: 1g
   
     
 volumes:
   mongo_data:
   spark_data:
+  postgres_data:
+  mlflow_artifacts:

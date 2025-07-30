@@ -9,6 +9,7 @@ import driver_simulation
 import lap_comparison
 import track_speed_heatmap
 import race_predictions
+import mlflow_dashboard
 
 # Set page config
 st.set_page_config(
@@ -336,7 +337,7 @@ with st.sidebar:
     st.header("F1 RaceFlux")
 
     # Create mode selector
-    selected_mode = st.radio("Select Mode", ["Data Visualization", "Race Predictions"])
+    selected_mode = st.radio("Select Mode", ["Data Visualization", "Race Predictions", "ML Experiments"])
 
     # Update session state when mode changes
     if selected_mode != st.session_state.mode:
@@ -810,6 +811,10 @@ if st.session_state.mode == "Data Visualization":
 elif st.session_state.mode == "Race Predictions":
     # PREDICTION MODE - Completely separate interface
     race_predictions.show_race_predictions()
+
+elif st.session_state.mode == "ML Experiments":
+    # MLFLOW EXPERIMENT TRACKING MODE
+    mlflow_dashboard.show_mlflow_dashboard()
 
 # Add footer
 st.markdown("---")
