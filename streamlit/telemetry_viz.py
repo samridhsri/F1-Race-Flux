@@ -111,6 +111,20 @@ def create_position_lap_scatter(
     if df.empty:
         return go.Figure()
 
+    # CRITICAL FIX: Check if Position column exists and has data
+    if "Position" not in df.columns:
+        st.error("❌ Position data is not available in the telemetry data.")
+        st.info("💡 Tip: Position data is only available for Race sessions, not Practice or Qualifying.")
+        return go.Figure()
+    
+    # Filter out rows where Position is null or NaN
+    df_with_position = df[df["Position"].notna()].copy()
+    
+    if df_with_position.empty:
+        st.warning("⚠️ No position data found for this session.")
+        st.info("💡 Position tracking is typically only available during Race sessions.")
+        return go.Figure()
+
     # Add a custom hover template with more information
     hover_template = (
         "<b>%{customdata[0]}</b> (#%{customdata[1]})<br>"
@@ -125,12 +139,12 @@ def create_position_lap_scatter(
     # Prepare figure
     fig = go.Figure()
 
-    # Get unique drivers
-    drivers = df["Driver"].unique()
+    # Get unique drivers from filtered data
+    drivers = df_with_position["Driver"].unique()
 
     # Add a trace for each driver
     for driver in drivers:
-        driver_df = df[df["Driver"] == driver]
+        driver_df = df_with_position[df_with_position["Driver"] == driver]
 
         if not driver_df.empty:
             # Get the team name (or Unknown if not available)
@@ -141,19 +155,17 @@ def create_position_lap_scatter(
             # Get color based on team name
             color = team_colors.get(team, team_colors["Unknown"])
 
-            # Create custom data for hover info
-            custom_data = driver_df[
-                [
-                    "Driver",
-                    "DriverNumber",
-                    "Team",
-                    "LapTime",
-                    "Compound",
-                    "Stint",
-                    "TyreLife",
-                    "AverageSpeed",
-                ]
-            ].values
+            # Create custom data for hover info - with safe field access
+            custom_data_cols = []
+            for col in ["Driver", "DriverNumber", "Team", "LapTime", "Compound", "Stint", "TyreLife", "AverageSpeed"]:
+                if col in driver_df.columns:
+                    custom_data_cols.append(col)
+                else:
+                    # Add a placeholder column if the field doesn't exist
+                    driver_df[col] = "N/A"
+                    custom_data_cols.append(col)
+            
+            custom_data = driver_df[custom_data_cols].values
 
             # Add scatter trace for this driver - markers only, no lines
             fig.add_trace(

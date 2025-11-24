@@ -122,12 +122,16 @@ def get_available_drivers(year: int, event: str, session_type: str) -> List[Dict
 
 
 # Function to get lap times for a driver
-def get_driver_lap_times(year: int, event: str, session_type: str, driver: str):
+def get_driver_lap_times(year: int, event: str, session_type: str, driver: str) -> pd.DataFrame:
+    """
+    Fetch lap times for a specific driver with defensive handling for missing fields
+    """
     try:
         client = get_mongodb_client()
         db = client[DB_NAME]
-
         telemetry_collection = db["telemetry"]
+
+        # Query for the driver's laps
         query = {
             "Year": year,
             "GrandPrix": event,
@@ -135,43 +139,49 @@ def get_driver_lap_times(year: int, event: str, session_type: str, driver: str):
             "Driver": driver,
         }
 
-        # Get lap data
-        lap_data = list(
-            telemetry_collection.find(
-                query,
-                {
-                    "LapNumber": 1,
-                    "LapTimeSeconds": 1,
-                    "Sector1TimeSeconds": 1,
-                    "Sector2TimeSeconds": 1,
-                    "Sector3TimeSeconds": 1,
-                    "IsPersonalBest": 1,
-                    "Deleted": 1,
-                    "Team": 1,
-                    "TeamID": 1,
-                    "_id": 0,
-                },
-            ).sort("LapNumber", 1)
-        )
+        # Projection to get relevant fields
+        projection = {
+            "LapNumber": 1,
+            "LapTime": 1,
+            "LapTimeSeconds": 1,  # This might not exist
+            "IsPersonalBest": 1,
+            "Deleted": 1,
+            "Team": 1,
+            "TeamID": 1,
+            "_id": 0,
+        }
 
-        # Convert to DataFrame
-        df = pd.DataFrame(lap_data)
+        # Fetch data
+        cursor = telemetry_collection.find(query, projection).sort("LapNumber", 1)
+        df = pd.DataFrame(list(cursor))
 
-        # Filter out invalid laps (deleted, missing lap times, etc.)
+        # CRITICAL FIX: Handle missing LapTimeSeconds field
         if not df.empty:
+            # Filter out deleted laps
             df = df[~df["Deleted"]] if "Deleted" in df.columns else df
-            df = (
-                df[~df["LapTimeSeconds"].isna()]
-                if "LapTimeSeconds" in df.columns
-                else df
-            )
+            
+            # Check if LapTimeSeconds exists, if not, create it from LapTime
+            if "LapTimeSeconds" not in df.columns:
+                if "LapTime" in df.columns:
+                    st.warning("⚠️ Converting LapTime to LapTimeSeconds (this may take a moment)...")
+                    df["LapTimeSeconds"] = df["LapTime"].apply(convert_laptime_to_seconds)
+                else:
+                    st.error("❌ No lap time data available for this driver")
+                    return pd.DataFrame()
+            
+            # Filter out rows where LapTimeSeconds is null or NaN
+            df = df[df["LapTimeSeconds"].notna()]
+            
+            # Additional filtering for invalid lap times (less than 30 seconds or more than 300 seconds)
+            df = df[(df["LapTimeSeconds"] >= 30) & (df["LapTimeSeconds"] <= 300)]
 
         return df
 
     except Exception as e:
         st.error(f"Error fetching lap times: {e}")
+        import traceback
+        st.error(traceback.format_exc())
         return pd.DataFrame()
-
 
 # Improved function to get team color
 def get_team_color(team_id: int = None, team_name: str = None) -> str:
@@ -248,6 +258,47 @@ def get_team_color(team_id: int = None, team_name: str = None) -> str:
     # If all else fails, return default
     return default_color
 
+def convert_laptime_to_seconds(lap_time_str):
+    """
+    Convert LapTime string (e.g., "0:01:32.123") to seconds
+    Handles various time formats:
+    - "0:01:32.123" (hours:minutes:seconds)
+    - "1:32.123" (minutes:seconds)
+    - "92.123" (just seconds)
+    """
+    if pd.isna(lap_time_str) or lap_time_str == "" or lap_time_str == "NaT":
+        return None
+    
+    try:
+        # If it's already a number, return it
+        if isinstance(lap_time_str, (int, float)):
+            return float(lap_time_str)
+        
+        # Convert to string
+        lap_time_str = str(lap_time_str)
+        
+        # Split by colon
+        parts = lap_time_str.split(":")
+        
+        if len(parts) == 3:
+            # Format: hours:minutes:seconds
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+        elif len(parts) == 2:
+            # Format: minutes:seconds
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60 + seconds
+        elif len(parts) == 1:
+            # Format: just seconds
+            return float(parts[0])
+        else:
+            return None
+    except Exception as e:
+        return None
+
 
 # Convert seconds to minutes:seconds format for display
 def format_lap_time(seconds):
@@ -272,6 +323,14 @@ def generate_lap_comparison(year: int, event: str, session_type: str, driver1, d
 
         if driver1_laps.empty or driver2_laps.empty:
             st.error("Unable to fetch lap times for one or both drivers")
+            return
+        
+        if "LapTimeSeconds" not in driver1_laps.columns:
+            st.error(f"❌ LapTimeSeconds field missing for {driver1['Driver']}")
+            return
+        
+        if "LapTimeSeconds" not in driver2_laps.columns:
+            st.error(f"❌ LapTimeSeconds field missing for {driver2['Driver']}")
             return
 
         # Convert lap times from seconds to minutes for better Y-axis display
