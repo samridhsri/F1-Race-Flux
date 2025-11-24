@@ -2,6 +2,7 @@ version: '3'
 services:
   zookeeper:
     image: confluentinc/cp-zookeeper:7.3.0
+    platform: linux/arm64
     container_name: zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
@@ -12,6 +13,7 @@ services:
     
   kafka:
     image: confluentinc/cp-kafka:7.3.0
+    platform: linux/arm64
     container_name: kafka
     depends_on:
       - zookeeper
@@ -37,6 +39,7 @@ services:
     
   mongodb:
     image: mongo:latest
+    platform: linux/arm64
     container_name: mongodb
     ports:
       - "27017:27017"
@@ -50,6 +53,7 @@ services:
     
   postgres:
     image: postgres:15
+    platform: linux/arm64
     container_name: mlflow-postgres
     environment:
       POSTGRES_DB: mlflowdb
@@ -64,6 +68,7 @@ services:
 
   mlflow:
     image: python:3.9-slim
+    platform: linux/arm64
     container_name: mlflow-server
     depends_on:
       - postgres
@@ -79,6 +84,51 @@ services:
     command: ["bash", "/app/start_mlflow.sh"]
     restart: always
     mem_limit: 1g
+    
+  spark-master:
+    image: bitnami/spark:3.3.2
+    platform: linux/arm64
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_DAEMON_MEMORY=2g
+      - SPARK_WORKER_MEMORY=8g
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_DAEMON_MEMORY=512m
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./:/app
+      - spark_data:/tmp/spark-events
+    depends_on:
+      - mongodb
+      - kafka
+    mem_limit: 2g
+    
+  spark-worker:
+    image: bitnami/spark:3.3.2
+    platform: linux/arm64
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+      - SPARK_DAEMON_MEMORY=2g
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - ./:/app
+      - spark_data:/tmp/spark-events
+    mem_limit: 5g
       
   spark-processor:
     build:
@@ -95,12 +145,12 @@ services:
       - KAFKA_BROKER=kafka:29092
       - MONGO_URI=mongodb://mongodb:27017/f1db
     restart: on-failure
-    mem_limit: 4g
     
   api:
     build:
       context: ./api
       dockerfile: Dockerfile
+    platform: linux/arm64
     container_name: api
     ports:
       - "8000:8000"
@@ -118,6 +168,7 @@ services:
       - PYTHONUNBUFFERED=1
     restart: always
     mem_limit: 1g
+    
     
   producer-builder:
     build:
@@ -145,8 +196,10 @@ services:
       - API_BASE_URL=http://api:8000
       - MLFLOW_TRACKING_URI=http://mlflow:5000
     mem_limit: 1g
+  
     
 volumes:
   mongo_data:
+  spark_data:
   postgres_data:
   mlflow_artifacts:
