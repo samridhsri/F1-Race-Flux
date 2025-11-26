@@ -229,10 +229,17 @@ def fetch_session_data(year, race_name, session_key):
 
         payload = {"year": year, "event": race_name, "session": session_key}
 
-        response = requests.post(f"{API_BASE_URL}/fetch-race-data", json=payload)
+        response = requests.post(f"{API_BASE_URL}/fetch-race-data", json=payload, timeout=30)
 
         if response.status_code != 200:
-            st.session_state.status_message = f"API error: {response.status_code}"
+            error_message = f"API error: {response.status_code}"
+            try:
+                error_detail = response.json().get("detail", "No details available")
+                error_message += f" - {error_detail}"
+            except:
+                error_message += f" - {response.text[:200] if response.text else 'No error details available'}"
+            
+            st.session_state.status_message = f"error:{error_message}"
             return False
 
         result = response.json()
@@ -282,8 +289,21 @@ def fetch_session_data(year, race_name, session_key):
             st.session_state.container_id = result.get("container_id")
 
         return True
+    except requests.exceptions.ConnectionError:
+        error_msg = f"Failed to connect to API at {API_BASE_URL}. Check if API service is running."
+        st.session_state.status_message = f"error:{error_msg}"
+        return False
+    except requests.exceptions.Timeout:
+        error_msg = "API request timed out. The API service might be overloaded."
+        st.session_state.status_message = f"error:{error_msg}"
+        return False
+    except requests.exceptions.RequestException as e:
+        error_msg = f"Request error: {str(e)}"
+        st.session_state.status_message = f"error:{error_msg}"
+        return False
     except Exception as e:
-        st.session_state.status_message = f"Error: {str(e)}"
+        error_msg = f"Unexpected error: {str(e)}"
+        st.session_state.status_message = f"error:{error_msg}"
         return False
     finally:
         st.session_state.loading = False
@@ -482,15 +502,20 @@ if st.session_state.mode == "Data Visualization":
 
             # Display single consolidated status message
             if st.session_state.status_message:
-                msg_type, msg_text = st.session_state.status_message.split(":", 1)
-                if msg_type == "success":
-                    st.success(msg_text)
-                elif msg_type == "info":
-                    st.info(msg_text)
-                elif msg_type == "warning":
-                    st.warning(msg_text)
+                # Handle status message format (type:text or just text)
+                if ":" in st.session_state.status_message:
+                    msg_type, msg_text = st.session_state.status_message.split(":", 1)
+                    if msg_type == "success":
+                        st.success(msg_text)
+                    elif msg_type == "info":
+                        st.info(msg_text)
+                    elif msg_type == "warning":
+                        st.warning(msg_text)
+                    else:
+                        st.error(msg_text)
                 else:
-                    st.error(msg_text)
+                    # If no colon, treat as error message
+                    st.error(st.session_state.status_message)
 
         st.markdown("</div>", unsafe_allow_html=True)
 

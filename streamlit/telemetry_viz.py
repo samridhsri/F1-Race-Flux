@@ -49,27 +49,11 @@ def fetch_session_telemetry(year: int, event: str, session_type: str) -> pd.Data
         db = client[DB_NAME]
         telemetry_collection = db["telemetry"]
 
-        # Query MongoDB for telemetry data
+        # Query MongoDB for telemetry data (lap-level data)
         query = {"Year": year, "GrandPrix": event, "SessionType": session_type}
 
-        # Select only the fields we need
-        projection = {
-            "LapNumber": 1,
-            "Position": 1,
-            "Driver": 1,
-            "Team": 1,
-            "TeamID": 1,
-            "LapTime": 1,
-            "Compound": 1,
-            "Stint": 1,
-            "TyreLife": 1,
-            "Time": 1,
-            "DriverNumber": 1,
-            "AverageSpeed": 1,
-        }
-
-        # Fetch the data and convert to a list of dictionaries
-        cursor = telemetry_collection.find(query, projection)
+        # Select all available fields - don't use projection to see what's actually there
+        cursor = telemetry_collection.find(query)
         data = list(cursor)
 
         # Convert to DataFrame
@@ -78,6 +62,61 @@ def fetch_session_telemetry(year: int, event: str, session_type: str) -> pd.Data
             # Remove _id column
             if "_id" in df.columns:
                 df = df.drop("_id", axis=1)
+            
+            # Check if Position column exists and has data
+            if "Position" not in df.columns or (df["Position"].isna().all() if "Position" in df.columns else True):
+                # For Race sessions, try to get Position from race_results collection
+                if session_type == "Race":
+                    try:
+                        race_results_collection = db["race_results"]
+                        results_query = {"Year": year, "GrandPrix": event, "SessionType": session_type}
+                        results_data = list(race_results_collection.find(results_query, {"Driver": 1, "Position": 1, "DriverNumber": 1}))
+                        
+                        if results_data:
+                            # Create a mapping of Driver to Position from race results
+                            results_df = pd.DataFrame(results_data)
+                            if "_id" in results_df.columns:
+                                results_df = results_df.drop("_id", axis=1)
+                            
+                            # Try to merge Position from race results
+                            if "Driver" in df.columns and "Driver" in results_df.columns:
+                                # Merge on Driver to get Position
+                                df = df.merge(
+                                    results_df[["Driver", "Position"]].drop_duplicates(subset=["Driver"]),
+                                    on="Driver",
+                                    how="left",
+                                    suffixes=("", "_from_results")
+                                )
+                                # Use Position from results if original Position is missing
+                                if "Position_from_results" in df.columns:
+                                    df["Position"] = df["Position"].fillna(df["Position_from_results"])
+                                    df = df.drop("Position_from_results", axis=1)
+                    except Exception as e:
+                        # If merging fails, just continue with empty Position
+                        pass
+                
+                # If Position is still not available, add empty column
+                if "Position" not in df.columns:
+                    df["Position"] = None
+                    if session_type != "Race":
+                        st.warning("⚠️ Position field not found in telemetry data. This is normal for Practice and Qualifying sessions.")
+                        st.info("💡 Position tracking is typically only available during Race sessions.")
+                elif df["Position"].isna().all():
+                    st.warning("⚠️ Position data is not available for this session.")
+                    if session_type != "Race":
+                        st.info("💡 Position tracking is typically only available during Race sessions.")
+            
+            # Select only the fields we need for visualization
+            desired_fields = [
+                "LapNumber", "Position", "Driver", "Team", "TeamID", 
+                "LapTime", "Compound", "Stint", "TyreLife", "Time", 
+                "DriverNumber", "AverageSpeed"
+            ]
+            
+            # Only include columns that exist in the dataframe
+            available_fields = [f for f in desired_fields if f in df.columns]
+            df = df[available_fields]
+            
             return df
         else:
             return pd.DataFrame()
@@ -114,7 +153,8 @@ def create_position_lap_scatter(
     # CRITICAL FIX: Check if Position column exists and has data
     if "Position" not in df.columns:
         st.error("❌ Position data is not available in the telemetry data.")
-        st.info("💡 Tip: Position data is only available for Race sessions, not Practice or Qualifying.")
+        st.info("💡 **Tip:** Position data is only available for Race sessions, not Practice or Qualifying.")
+        st.info("📊 For Practice/Qualifying sessions, try the 'Lap Comparison' or 'Track Speed Heatmap' visualizations instead.")
         return go.Figure()
     
     # Filter out rows where Position is null or NaN
@@ -122,7 +162,8 @@ def create_position_lap_scatter(
     
     if df_with_position.empty:
         st.warning("⚠️ No position data found for this session.")
-        st.info("💡 Position tracking is typically only available during Race sessions.")
+        st.info("💡 **Tip:** Position tracking is typically only available during Race sessions.")
+        st.info("📊 For this session type, try other visualizations like 'Lap Comparison' or 'Track Speed Heatmap'.")
         return go.Figure()
 
     # Add a custom hover template with more information
@@ -274,9 +315,14 @@ def show_telemetry_visualization(year: int, event: str, session_type: str):
 
             # Optionally show data table
             with st.expander("View Raw Telemetry Data"):
+                sort_columns = ["LapNumber"]
+                if "Position" in st.session_state.telemetry_data.columns:
+                    if st.session_state.telemetry_data["Position"].notna().any():
+                        sort_columns.append("Position")
+                if "Driver" in st.session_state.telemetry_data.columns and "Position" not in sort_columns:
+                    sort_columns.append("Driver")
+
                 st.dataframe(
-                    st.session_state.telemetry_data.sort_values(
-                        by=["LapNumber", "Position"]
-                    ),
+                    st.session_state.telemetry_data.sort_values(by=sort_columns),
                     use_container_width=True,
                 )

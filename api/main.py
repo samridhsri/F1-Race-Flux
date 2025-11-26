@@ -26,6 +26,69 @@ collection = db["telemetry"]
 circuit_collection = db["circuits"]
 # Docker client
 docker_client = docker.from_env()
+
+def get_docker_network_name():
+    """Get the Docker network name by finding the network that contains required services"""
+    try:
+        # First, try to get network from current container (api container) - most reliable
+        try:
+            api_container = docker_client.containers.get("api")
+            if api_container.attrs.get("NetworkSettings", {}).get("Networks"):
+                network_name = list(api_container.attrs["NetworkSettings"]["Networks"].keys())[0]
+                logger.info(f"Detected network from API container: {network_name}")
+                return network_name
+        except Exception as e:
+            logger.warning(f"Could not get network from API container: {e}")
+        
+        # Fallback: Look for a network that contains kafka and mongodb containers
+        try:
+            networks = docker_client.networks.list()
+            for network in networks:
+                try:
+                    # Refresh network to get containers
+                    network.reload()
+                    containers = network.containers
+                    container_names = [c.name for c in containers]
+                    if "kafka" in container_names and "mongodb" in container_names:
+                        logger.info(f"Detected network from container search: {network.name}")
+                        return network.name
+                except Exception as e:
+                    logger.warning(f"Error checking network {network.name}: {e}")
+                    continue
+        except Exception as e:
+            logger.warning(f"Error listing networks: {e}")
+        
+        # Try to find network by common patterns
+        try:
+            networks = docker_client.networks.list()
+            for network in networks:
+                # Look for networks with common docker-compose naming patterns
+                if "_default" in network.name and network.name != "bridge":
+                    logger.info(f"Using network with default pattern: {network.name}")
+                    return network.name
+        except:
+            pass
+        
+        # Final fallback - try common names
+        fallback_names = ["f1-race-flux_default", "f1-data-pipeline_default"]
+        for name in fallback_names:
+            try:
+                network = docker_client.networks.get(name)
+                logger.info(f"Using fallback network: {name}")
+                return name
+            except:
+                continue
+        
+        # Last resort fallback
+        logger.error("Could not detect network name, using hardcoded fallback")
+        return "f1-race-flux_default"
+    except Exception as e:
+        logger.error(f"Could not detect network name: {e}, using fallback")
+        return "f1-race-flux_default"
+
+# Network name will be detected lazily when needed
+# Don't cache it at module load time as containers may not be ready
+
 # FastAPI setup
 app = FastAPI(title="F1 Data API")
 # CORS for frontend communication
@@ -277,7 +340,7 @@ async def fetch_race_data(request: RaceDataRequest):
                 "MONGO_URI": "mongodb://mongodb:27017/f1db",
             },
             volumes={"/tmp/checkpoint": {"bind": "/tmp/checkpoint", "mode": "rw"}},
-            network="f1-data-pipeline_default",
+            network=get_docker_network_name(),
             labels={
                 "year": str(request.year),
                 "event": event_param,
@@ -294,9 +357,22 @@ async def fetch_race_data(request: RaceDataRequest):
             "message": f"Processing data for missing collections: {missing_collections}",
         }
 
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except docker.errors.DockerException as e:
+        logger.error(f"Docker error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Docker error: {str(e)}")
+    except pymongo.errors.ServerSelectionTimeoutError as e:
+        logger.error(f"MongoDB connection error: {e}")
+        raise HTTPException(status_code=500, detail=f"MongoDB connection error: {str(e)}")
     except Exception as e:
-        logger.error(f"Failed to start container: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to fetch race data: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.post("/check-processing-status")
@@ -359,6 +435,7 @@ async def check_processing_status(request: RaceDataRequest):
 
         collection_counts = {}
         all_collections_have_data = True
+        total_data_count = 0
 
         # Check each collection for data matching our query
         for coll_name in required_collections:
@@ -366,6 +443,7 @@ async def check_processing_status(request: RaceDataRequest):
                 collection = db[coll_name]
                 count = collection.count_documents(query)
                 collection_counts[coll_name] = count
+                total_data_count += count
 
                 # If any collection has zero documents, mark all_collections_have_data as False
                 if count == 0:
@@ -375,41 +453,97 @@ async def check_processing_status(request: RaceDataRequest):
                 all_collections_have_data = False
                 collection_counts[coll_name] = 0
 
+        # Check container status first to determine if processing is truly complete
+        container_status = "stopped"
+        container_id = None
+        container_exited_successfully = False
+        
+        try:
+            all_producer_containers = docker_client.containers.list(
+                filters={"ancestor": "producer-image"}, all=True
+            )
+            
+            for container in all_producer_containers:
+                labels = container.labels
+                container_year = labels.get("year")
+                container_event = labels.get("event")
+                container_session = labels.get("session")
+                
+                if (
+                    container_year == str(request.year)
+                    and container_event == event_param
+                    and container_session == request.session
+                ):
+                    container.reload()
+                    status = container.status.lower()
+                    
+                    if "running" in status or "up" in status:
+                        container_status = "running"
+                        container_id = container.short_id
+                        break
+                    elif "exited" in status:
+                        exit_code = container.attrs.get("State", {}).get("ExitCode", -1)
+                        if exit_code == 0:
+                            container_exited_successfully = True
+                            container_id = container.short_id
+                            logger.info(
+                                f"Container {container.short_id} finished successfully with {total_data_count} total records"
+                            )
+                        else:
+                            logger.warning(
+                                f"Container {container.short_id} exited with error code {exit_code}"
+                            )
+        except Exception as e:
+            logger.error(f"Error checking container status: {e}")
+
+        # If all collections have data, processing is complete
         if all_collections_have_data:
             return {
                 "status": "complete",
-                "message": "Data processing complete",
-                "counts": collection_counts,
-            }
-        else:
-            # Check for producer container status using labels
-            container_filter = {
-                "ancestor": "producer-image",
-                "label": [
-                    f"year={request.year}",
-                    f"event={event_param}",
-                    f"session={request.session}",
-                ],
-            }
-
-            container_status = "stopped"
-            container_id = None
-
-            try:
-                # Try to find any running producer containers for this specific session
-                containers = docker_client.containers.list(filters=container_filter)
-                if containers:
-                    container_status = "running"
-                    container_id = containers[0].short_id
-            except Exception as e:
-                logger.error(f"Error checking container status: {e}")
-
-            return {
-                "status": "processing",
-                "message": f"Data processing in progress. Container status: {container_status}",
+                "message": "Data processing complete - all collections have data",
+                "container_status": container_status,
                 "container_id": container_id,
                 "counts": collection_counts,
             }
+        # If container exited successfully and we have some data, consider it complete
+        elif container_exited_successfully and total_data_count > 0:
+            return {
+                "status": "complete",
+                "message": f"Data processing complete - container finished successfully with {total_data_count} total records",
+                "container_status": "stopped",
+                "container_id": container_id,
+                "counts": collection_counts,
+            }
+        # If container is still running, it's processing
+        elif container_status == "running":
+            return {
+                "status": "processing",
+                "message": f"Data processing in progress. Container is running. Found {total_data_count} records so far.",
+                "container_status": container_status,
+                "container_id": container_id,
+                "counts": collection_counts,
+            }
+        else:
+            # Container stopped but no data or incomplete data
+            if container_exited_successfully:
+                # Container finished but data might still be processing in Spark/consumer
+                # Or data might be incomplete
+                return {
+                    "status": "processing",
+                    "message": f"Container finished, but data may still be processing. Found {total_data_count} records so far. Some collections may still be empty.",
+                    "container_status": "stopped",
+                    "container_id": container_id,
+                    "counts": collection_counts,
+                }
+            else:
+                # No container found or container failed
+                return {
+                    "status": "processing",
+                    "message": f"No active container found. Found {total_data_count} records. Data may still be processing or container may have failed.",
+                    "container_status": container_status,
+                    "container_id": container_id,
+                    "counts": collection_counts,
+                }
 
     except Exception as e:
         logger.error(f"Failed to check processing status: {e}")
@@ -649,7 +783,7 @@ async def start_prediction(request: PredictionRequest):
                 "MONGO_URI": "mongodb://mongodb:27017/f1db",
             },
             volumes={"/tmp/checkpoint": {"bind": "/tmp/checkpoint", "mode": "rw"}},
-            network="f1-data-pipeline_default",
+            network=get_docker_network_name(),
             labels={"type": "prediction_processor", "prediction_event": event_name},
             detach=True,
             remove=False,
